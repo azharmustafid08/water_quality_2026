@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Marine Monitoring</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #f4f6f9; --card: #ffffff; --text: #1a2233; --muted: #667085;
+    --line: #e3e8ef; --ok: #12a150; --bad: #d92d20; --accent: #2563eb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0e1420; --card: #172033; --text: #e6ebf5; --muted: #93a0b8;
+            --line: #26324a; --ok: #32d583; --bad: #f97066; --accent: #6ea0ff; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 16px; }
+  header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; justify-content: space-between; }
+  h1 { font-size: 20px; margin: 0; }
+  .status { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); }
+  .dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; align-items: center; }
+  button, select { font: inherit; padding: 6px 12px; border-radius: 8px; border: 1px solid var(--line);
+                   background: var(--card); color: var(--text); cursor: pointer; }
+  button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .spacer { flex: 1; }
+  .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+  .card h2 { font-size: 13px; margin: 0; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+  .val { font-size: 32px; font-weight: 700; margin: 4px 0 0; }
+  .unit { font-size: 14px; font-weight: 400; color: var(--muted); margin-left: 4px; }
+  .meta { font-size: 12px; color: var(--muted); min-height: 18px; }
+  .chart { position: relative; height: 150px; margin-top: 8px; }
+  .msg { padding: 12px; border-radius: 8px; background: var(--card); border: 1px solid var(--line); margin: 12px 0; display: none; }
+  footer { color: var(--muted); font-size: 12px; margin: 18px 0 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Marine Monitoring</h1>
+    <span class="status"><span class="dot" id="dot"></span><span id="statusText">Memuat…</span></span>
+  </header>
+
+  <div class="toolbar">
+    <button data-range="1">1 jam</button>
+    <button data-range="6">6 jam</button>
+    <button data-range="24" class="active">24 jam</button>
+    <button data-range="168">7 hari</button>
+    <span class="spacer"></span>
+    <button id="btnRefresh">Muat ulang</button>
+    <button id="btnCsv">Unduh CSV</button>
+  </div>
+
+  <div class="msg" id="msg"></div>
+  <div class="grid" id="grid"></div>
+  <footer id="footer"></footer>
+</div>
+
+<script src="config.js"></script>
+<script>
+(function () {
+  var CFG = window.DASHBOARD_CONFIG;
+  var SENSORS = [
+    { key: "Nilai_pH",        label: "pH",                  unit: "",      volt: "Tegangan_pH",        color: "#2563eb", dec: 2 },
+    { key: "Nilai_Turbidity", label: "Kekeruhan",           unit: "NTU",   volt: "Tegangan_Turbidity", color: "#d97706", dec: 1 },
+    { key: "Nilai_DO",        label: "Oksigen Terlarut (DO)", unit: "mg/L", volt: "Tegangan_DO",        color: "#059669", dec: 2 },
+    { key: "Nilai_EC",        label: "Konduktivitas (EC)",  unit: "",      volt: "Tegangan_EC",        color: "#9333ea", dec: 2 },
+    { key: "Flow_Rate",       label: "Debit (Flow)",        unit: "",      volt: null,                 color: "#e11d48", dec: 2 },
+    { key: "Temperature",     label: "Suhu",                unit: "°C",    volt: null,                 color: "#0891b2", dec: 2 }
+  ];
+  var MAX_POINTS = 600;
+  var hours = 24, data = null, timer = null, charts = {}, els = {};
+
+  var grid = document.getElementById("grid");
+  SENSORS.forEach(function (s) {
+    var card = document.createElement("div");
+    card.className = "card";
+    card.innerHTML = '<h2>' + s.label + '</h2>' +
+      '<div class="val"><span data-v="' + s.key + '">–</span><span class="unit">' + s.unit + '</span></div>' +
+      '<div class="meta" data-m="' + s.key + '"></div>' +
+      '<div class="chart"><canvas></canvas></div>';
+    grid.appendChild(card);
+    els[s.key] = { v: card.querySelector("[data-v]"), m: card.querySelector("[data-m]") };
+    charts[s.key] = new Chart(card.querySelector("canvas"), {
+      type: "line",
+      data: { labels: [], datasets: [{ data: [], borderColor: s.color, backgroundColor: s.color + "22",
+              borderWidth: 1.6, pointRadius: 0, tension: 0.25, fill: true, spanGaps: true }] },
+      options: {
+        animation: false, maintainAspectRatio: false, responsive: true,
+        plugins: { legend: { display: false } },
+        scales: { x: { ticks: { maxTicksLimit: 5, maxRotation: 0, font: { size: 10 } }, grid: { display: false } },
+                  y: { ticks: { font: { size: 10 } } } }
+      }
+    });
+  });
+
+  function pad(n) { return (n < 10 ? "0" : "") + n; }
+  function parseTs(s) { return new Date(String(s).replace(" ", "T") + CFG.TZ_OFFSET); }
+  function showMsg(t) { var m = document.getElementById("msg"); m.textContent = t; m.style.display = t ? "block" : "none"; }
+
+  // "since" dalam waktu lokal Pi (sama dengan format timestamp di Sheet)
+  function sinceString(h) {
+    var d = new Date(Date.now() - h * 3600e3 + offsetMs());
+    return d.getUTCFullYear() + "-" + pad(d.getUTCMonth() + 1) + "-" + pad(d.getUTCDate()) + " " +
+           pad(d.getUTCHours()) + ":" + pad(d.getUTCMinutes()) + ":" + pad(d.getUTCSeconds());
+  }
+  function offsetMs() {
+    var m = /([+-])(\d\d):(\d\d)/.exec(CFG.TZ_OFFSET);
+    return (m[1] === "-" ? -1 : 1) * (+m[2] * 60 + +m[3]) * 60e3;
+  }
+
+  function load() {
+    if (!CFG.API_URL) { showMsg("API_URL belum diisi di config.js."); return; }
+    document.getElementById("statusText").textContent = "Memuat…";
+    fetch(CFG.API_URL + "?since=" + encodeURIComponent(sinceString(hours)))
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (!j.ok) throw new Error(j.error || "respon tidak valid");
+        data = j; showMsg(""); render();
+      })
+      .catch(function (e) {
+        showMsg("Gagal mengambil data: " + e.message);
+        document.getElementById("dot").className = "dot bad";
+        document.getElementById("statusText").textContent = "Gagal memuat";
+      });
+  }
+
+  function render() {
+    var H = data.headers, rows = data.rows;
+    var idx = {}; H.forEach(function (h, i) { idx[h] = i; });
+    var dot = document.getElementById("dot"), st = document.getElementById("statusText");
+    if (!rows.length) {
+      dot.className = "dot bad"; st.textContent = "Tidak ada data pada rentang ini";
+      SENSORS.forEach(function (s) { charts[s.key].data.labels = []; charts[s.key].data.datasets[0].data = []; charts[s.key].update(); });
+      return;
+    }
+
+    var step = Math.max(1, Math.ceil(rows.length / MAX_POINTS));
+    var sampled = rows.filter(function (_, i) { return i % step === 0 || i === rows.length - 1; });
+    var long = hours > 24;
+    var labels = sampled.map(function (r) {
+      var t = String(r[0]); return long ? t.slice(5, 16) : t.slice(11, 16);
+    });
+
+    var lastRow = rows[rows.length - 1];
+    SENSORS.forEach(function (s) {
+      var vals = sampled.map(function (r) { var v = r[idx[s.key]]; return (v === "" || v === null) ? null : Number(v); });
+      var c = charts[s.key];
+      c.data.labels = labels; c.data.datasets[0].data = vals; c.update();
+      var lv = lastRow[idx[s.key]];
+      els[s.key].v.textContent = (lv === "" || lv === null) ? "N/A" : Number(lv).toFixed(s.dec);
+      els[s.key].m.textContent = s.volt ? "Tegangan: " + Number(lastRow[idx[s.volt]]).toFixed(3) + " V" : "";
+    });
+
+    var ageSec = (Date.now() - parseTs(lastRow[0]).getTime()) / 1000;
+    var online = ageSec < CFG.SEND_INTERVAL * 3 + 30;
+    dot.className = "dot " + (online ? "ok" : "bad");
+    st.textContent = (online ? "Online" : "Offline") + " · data terakhir " + lastRow[0] +
+                     " (" + (ageSec < 3600 ? Math.round(ageSec / 60) + " mnt" : (ageSec / 3600).toFixed(1) + " jam") + " lalu)";
+    document.getElementById("footer").textContent =
+      rows.length + " titik data dimuat" + (step > 1 ? " (grafik disampel tiap " + step + " titik)" : "") +
+      " · diperbarui otomatis tiap " + CFG.REFRESH_SECONDS + " detik";
+  }
+
+  function downloadCsv() {
+    if (!data || !data.rows.length) return;
+    var lines = [data.headers.join(",")].concat(data.rows.map(function (r) { return r.join(","); }));
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([lines.join("\n")], { type: "text/csv" }));
+    a.download = "marine_" + hours + "jam.csv";
+    a.click(); URL.revokeObjectURL(a.href);
+  }
+
+  document.querySelectorAll("[data-range]").forEach(function (b) {
+    b.addEventListener("click", function () {
+      document.querySelectorAll("[data-range]").forEach(function (x) { x.classList.remove("active"); });
+      b.classList.add("active"); hours = +b.dataset.range; load();
+    });
+  });
+  document.getElementById("btnRefresh").addEventListener("click", load);
+  document.getElementById("btnCsv").addEventListener("click", downloadCsv);
+
+  load();
+  timer = setInterval(load, CFG.REFRESH_SECONDS * 1000);
+})();
+</script>
+</body>
+</html>
